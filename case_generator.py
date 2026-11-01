@@ -8,6 +8,7 @@ from pathlib import Path
 from openai import OpenAI
 from dotenv import load_dotenv
 from validator import validate_generated_case, CLUE_ROLE_LIMITS
+from case_quality import check_case_quality, split_warnings
 from usage_counter import counted_call
 
 # .env 파일의 API 키를 불러옴
@@ -64,6 +65,12 @@ SYSTEM_PROMPT = f"""
 11. 단서 설명에 범인의 이름을 직접 쓰지 않습니다. 플레이어가 심문과 증거 조합으로 범인을 추리해야 합니다.
 12. 단서의 desc는 role과 맞아야 합니다. 정황·결정적 단서가 오히려 범인의 알리바이를 뒷받침하면 안 됩니다.
 13. 자연스럽고 맞춤법이 맞는 한국어로 씁니다.
+14. culprit_id는 사용자가 지정한 번호를 그대로 씁니다. (예시 JSON의 번호를 따라 하지 않음)
+15. 모든 용의자의 pressure_level은 0입니다.
+16. 단서 이름에는 사람 이름을 넣지 않습니다. 결정적·정황 단서 설명에도 범인 이름을 직접 쓰지 않고 직업·소지품·습관으로 간접적으로 가리킵니다.
+17. 범인을 가리키는 결정적·정황·모순 단서는 모두 범인의 evidence_effects에 넣고,
+    무고한 사람을 의심하게 만드는 미스리드·모순 단서는 그 사람의 evidence_effects에 넣습니다.
+18. 세 용의자의 speech_style은 서로 확실히 다르게 만듭니다. (예: 격식체 냉정형 / 반말 섞인 다혈질형 / 말줄임표 많은 소심형)
 
 [JSON 구조]
 {{
@@ -73,14 +80,22 @@ SYSTEM_PROMPT = f"""
   "location": "사건 장소",
   "time_of_death": "사망 추정 시각",
   "truth": "실제로 무슨 일이 있었는지 (플레이어에게 비공개)",
-  "culprit_id": 2,
+  "culprit_id": 1,
   "decisive_evidence_id": "E01",
   "suspects": [
     {{
       "suspect_id": 1,
       "name": "이름",
       "job": "직업 또는 피해자와의 관계",
-      "personality": "성격과 말투",
+      "personality": "성격",
+      "speech_style": {{
+        "honorific": "격식체 존댓말 / 해요체 / 반말 섞임 중 하나와 설명",
+        "sentence": "문장 길이와 리듬",
+        "habit": "자주 쓰는 말버릇",
+        "evasion": "곤란한 질문을 피하는 방식",
+        "under_pressure": "압박받을 때 말투 변화",
+        "examples": ["이 사람이 할 법한 대사 1", "대사 2"]
+      }},
       "description": "공개 소개",
       "alibi": "본인이 주장하는 알리바이",
       "public": ["물어보면 말해 주는 정보"],
@@ -97,7 +112,7 @@ SYSTEM_PROMPT = f"""
       "desc": "단서 설명",
       "found_at": "발견 장소",
       "role": "결정적",
-      "related_suspect_id": 2
+      "related_suspect_id": 1
     }}
   ]
 }}
@@ -143,6 +158,7 @@ def to_server_truth(raw: dict) -> dict:
             "name": s.get("name", ""),
             "job": s.get("job", ""),
             "personality": s.get("personality", ""),
+            "speech_style": s.get("speech_style") or {},
             "description": s.get("description", ""),
             "alibi": s.get("alibi", ""),
             "knowledge": {
@@ -183,12 +199,15 @@ def to_server_truth(raw: dict) -> dict:
 
 def _call_ai(messages: list, temperature: float = 0.9, kind: str = "사건 생성") -> str:
     # 호출할 때마다 usage_counter가 횟수를 기록함
+    # 사건 JSON은 길어서(약 4천~8천 토큰) 모델 기본 출력 한도에 걸리면 중간에 잘림 → 한도를 직접 지정
+    max_tokens = int(os.getenv("CASE_MAX_TOKENS", "16000"))
     try:
         response = counted_call(kind, lambda: client.chat.completions.create(
             model=CASE_MODEL_NAME,
             response_format={"type": "json_object"},
             messages=messages,
             temperature=temperature,
+            max_tokens=max_tokens,
         ))
     except Exception:
         # JSON 모드를 지원하지 않는 모델이면 일반 모드로 한 번 더 시도
@@ -196,8 +215,13 @@ def _call_ai(messages: list, temperature: float = 0.9, kind: str = "사건 생�
             model=CASE_MODEL_NAME,
             messages=messages,
             temperature=temperature,
+            max_tokens=max_tokens,
         ))
-    return response.choices[0].message.content or ""
+    choice = response.choices[0]
+    if getattr(choice, "finish_reason", None) == "length":
+        # 잘린 JSON을 파싱하면 'Expecting , delimiter' 같은 알기 어려운 오류가 나므로 원인을 직접 알려 줌
+        raise ValueError("AI 응답이 출력 한도에서 잘렸습니다. (.env의 CASE_MAX_TOKENS를 늘리거나 단서 설명을 짧게)")
+    return choice.message.content or ""
 
 
 def review_case(case: dict) -> list[str] | None:
@@ -244,7 +268,8 @@ def review_case(case: dict) -> list[str] | None:
     return problems or ["검토 AI가 통과시키지 않았지만 이유를 적지 않았습니다."]
 
 
-def generate_case(case_type: str | None = None, place: str | None = None) -> dict:
+def generate_case(case_type: str | None = None, place: str | None = None,
+                  culprit_id: int | None = None) -> dict:
     """
     AI로 사건을 만들고 두 단계로 확인합니다.
       1단계 규칙 검사기: 용의자 수, 단서 역할 태그 등 (실패하면 반드시 다시 생성)
@@ -255,10 +280,14 @@ def generate_case(case_type: str | None = None, place: str | None = None) -> dic
     """
     case_type = case_type or random.choice(CASE_TYPES)
     place = place or random.choice(PLACES)
+    # 범인 번호는 서버가 무작위로 정함 (AI에게 맡기면 예시 JSON을 따라 거의 항상 2번이 범인이 됨)
+    culprit_id = culprit_id or random.choice([1, 2, 3])
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"사건 유형: {case_type}\n장소: {place}\n위 조건으로 새 사건을 만들어 주십시오."},
+        {"role": "user", "content": f"사건 유형: {case_type}\n장소: {place}\n"
+                                    f"범인: suspect_id {culprit_id}번 (culprit_id = {culprit_id})\n"
+                                    "위 조건으로 새 사건을 만들어 주십시오."},
     ]
     attempts = []
     backup = None   # 규칙은 통과했지만 검토 지적이 남은 가장 최근 사건 (예비용)
@@ -268,6 +297,9 @@ def generate_case(case_type: str | None = None, place: str | None = None) -> dic
             content = _call_ai(messages)
             case = to_server_truth(_extract_json(content))
             errors = validate_generated_case(case)
+            if not errors:
+                # 형식이 맞으면 내용 품질 검사 (AI 호출 없음). [경고]는 재생성 사유에서 제외
+                errors, _warnings = split_warnings(check_case_quality(case, expected_culprit_id=culprit_id))
         except Exception as e:
             content = ""
             case = None

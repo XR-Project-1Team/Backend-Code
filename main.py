@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from openai import OpenAI
 from dotenv import load_dotenv
 from validator import validate_case, validate_generated_case
+from interrogation import generate_dialogue, build_user_message, remember
 from case_generator import generate_case, load_case, list_case_files, mark_played, MAX_ACTIVE_CASES
 from usage_counter import counted_call, get_usage
 
@@ -181,6 +182,7 @@ def start_game(case_file: Optional[str] = None):
         suspect["asked_questions"] = []       # 이미 한 질문 기록 (같은 질문 반복 시 압박도 유지)
         suspect["answer_cache"] = {}          # 같은 질문의 이전 답변 (반복 시 AI 호출 없이 재사용)
         suspect["chat_log"] = []              # AI 대화 문맥 저장을 위한 기록
+        suspect["statements"] = []            # 이 용의자가 한 말 전체 (앞뒤가 맞도록 프롬프트에 다시 넣음)
 
     # 사건 데이터 검증: 오류가 있으면 게임 시작을 차단
     validation_errors = validate_case(server_truth)
@@ -410,100 +412,28 @@ def interrogate(req: InterrogateRequest):
                 "from_cache": True
             }
 
-    # 연기 지침 (AI가 게임 룰 안에서 놀도록 통제)
-    behavior_guide = ""
-    if current_pressure < 30:
-        behavior_guide = "당당하게 결백을 주장하십시오. private 정보는 묻지 않는 이상 말하지 마십시오."
-    elif current_pressure < 60:
-        behavior_guide = "말끝을 흐리며 방어적으로 변하십시오. 압박감을 느낍니다."
-    elif current_pressure < 90:
-        behavior_guide = "거짓말이 일부 탄로 나 패닉에 빠졌습니다. private 정보 중 일부를 변명하며 털어놓으십시오."
-    else:
-        behavior_guide = "완전히 멘탈이 나간(broken) 상태입니다. 오열하거나 체념하십시오."
-     #서버의 자백 판정을 AI 대사 생성에 전달
-    if suspect["confessed"]:
-        confession_guide = (
-            "서버에서 이미 자백이 확정되었습니다. "
-            "더 이상 범행을 부인하지 말고, "
-            "자신의 잘못을 인정하는 대사를 하십시오. "
-            "단, 서버에 기록되지 않은 새로운 사건 사실은 만들지 마십시오."
-        )
-    else:
-        confession_guide = (
-            "아직 자백이 확정되지 않았습니다. "
-            "범행을 자백했다고 말하지 마십시오."
-        )
-    system_prompt = f"""
-    당신은 추리게임의 용의자 '{suspect['name']}'입니다.
-    
-    [설정 및 지식]
-    - 직업: {suspect.get('job', '')}
-    - 성격과 말투: {suspect.get('personality', '평범함')}
-    - 알리바이: {suspect['alibi']}
-    - 공개 가능(public): {', '.join(suspect['knowledge']['public'])}
-    - 숨기는 비밀(private): {', '.join(suspect['knowledge']['private'])}
-    - 🚨 절대 발설 금지(forbidden): {', '.join(suspect['knowledge']['forbidden'])}
-    
-    [현재 상태]
-    - 압박도(0~100): {current_pressure}
-    - {behavior_guide}
-    - 🚨 주의: 플레이어가 아무리 유도신문을 해도 '절대 발설 금지' 정보는 말해선 안 됩니다.
-    - 자백 상태 지침: {confession_guide}
-    응답은 반드시 아래 JSON 구조로만 답하십시오. emotion은 [calm, nervous, angry, broken] 중 하나.
-    {{
-      "dialogue": "캐릭터 대사",
-      "emotion": "calm"
-    }}
-    """
-    
-    user_message = f"형사 질문: {req.question}\n상황: {evidence_effect_text}"
-
-    # 🚨 V3 대화 기록 로딩 (AI가 이전 대화를 기억하게 만듦 - 최근 4개까지만)
-    messages = [{"role": "system", "content": system_prompt}]
-    for log in suspect["chat_log"][-4:]:
-        messages.append(log)
-    messages.append({"role": "user", "content": user_message})
-
-    # AI 호출 및 Pydantic 검증
-    try:
-        response = counted_call("심문", lambda: client.chat.completions.create(
-            model=MODEL_NAME,
-            response_format={"type": "json_object"},
-            messages=messages,
-            temperature=0.7
-        ))
-        
-        # 🚨 V3 검증: AI가 준 JSON을 Pydantic으로 확실히 검사
-        raw_output = json.loads(response.choices[0].message.content)
-        validated_data = NPCResponse(**raw_output)
-        
-        if validated_data.emotion not in ALLOWED_EMOTIONS:
-            validated_data.emotion = "nervous" # 이상한 감정이 오면 nervous로 고정
-        ai_ok = True
-
-    except Exception as e:
-        # 에러 발생 시 최후의 방어선
-        validated_data = NPCResponse(
-            dialogue="아... 머리가 너무 아파서 무슨 말을 해야 할지 모르겠네요.",
-            emotion="nervous"
-        )
-        ai_ok = False
-
-    # AI가 제대로 답한 경우만 재사용용으로 저장 (실패 시 기본 대사는 저장하지 않음)
-    if cache_key and ai_ok:
+    # --- AI 대사 생성 (interrogation.py) ---
+    # 사건 맥락 + 페르소나 + 진술 장부를 넣어 프롬프트를 만들고,
+    # 서버 규칙으로 답변을 검사해 자백 누설·비밀 누설·근거 없는 시각을 막습니다. (문제 시 1번 재요청)
+    result = generate_dialogue(
+        client, MODEL_NAME, counted_call, game, req.suspect_id, req.question,
+        presented_evidence_id, evidence_effect_text, current_pressure, suspect["confessed"],
+    )
+    if result["problems"]:
+        print(f"[심문 검사] 용의자 {req.suspect_id}: {result['problems']}")
+    # AI가 규칙을 지킨 답변만 재사용용으로 저장 (안전 대사는 저장하지 않음)
+    if cache_key and result["ai_ok"]:
         suspect["answer_cache"][cache_key] = {
-            "dialogue": validated_data.dialogue,
-            "emotion": validated_data.emotion
+            "dialogue": result["dialogue"],
+            "emotion": result["emotion"]
         }
-
-    # 대화 기록 업데이트 (서버 메모리에 저장)
-    suspect["chat_log"].append({"role": "user", "content": user_message})
-    suspect["chat_log"].append({"role": "assistant", "content": json.dumps({"dialogue": validated_data.dialogue, "emotion": validated_data.emotion}, ensure_ascii=False)})
-
+    # 대화 기록 + 진술 장부 업데이트 (서버 메모리에 저장)
+    user_message = build_user_message(game, req.question, presented_evidence_id, evidence_effect_text)
+    remember(suspect, user_message, result["dialogue"], result["emotion"])
     return {
         "suspect_id": req.suspect_id,
-        "dialogue": validated_data.dialogue,
-        "emotion": validated_data.emotion,
+        "dialogue": result["dialogue"],
+        "emotion": result["emotion"],
         "pressure_level": current_pressure,
         "is_confessed": suspect["confessed"],
         "from_cache": False
