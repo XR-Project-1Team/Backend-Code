@@ -11,6 +11,8 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from validator import validate_case, validate_generated_case
 from interrogation import generate_dialogue, build_user_message, remember
+from game_rules import (resolve_category, judge_vital, new_accuse_state, judge_accusation,
+                        normalize_question, key_clues_for, pressure_cap, raise_pressure)
 from case_generator import generate_case, load_case, list_case_files, mark_played, MAX_ACTIVE_CASES
 from usage_counter import counted_call, get_usage
 
@@ -36,6 +38,7 @@ class InterrogateRequest(BaseModel):
     suspect_id: int
     question: str
     presented_evidence_id: Optional[str] = None
+    question_category: Optional[str] = None   # 관계 / 알리바이 / 감정 / 증거제시 (없으면 서버가 짐작)
 
 class AccuseRequest(BaseModel):
     game_id: str
@@ -197,7 +200,7 @@ def start_game(case_file: Optional[str] = None):
         )
 
     # 검증을 통과한 사건만 게임 세션에 등록
-    active_games[game_id] = {"truth": server_truth, "case_source": source}
+    active_games[game_id] = {"truth": server_truth, "case_source": source, "accuse": new_accuse_state()}
 
     # 플레이어(Unity)에게는 공개 정보만 전달 (범인·역할 태그·비밀은 숨김)
     public_info = {
@@ -314,14 +317,25 @@ def interrogate(req: InterrogateRequest):
     if req.game_id not in active_games:
         raise HTTPException(status_code=404, detail="존재하지 않는 게임입니다.")
     
-    game = active_games[req.game_id]["truth"]
+    session = active_games[req.game_id]
+    game = session["truth"]
     suspect = game["suspects"].get(req.suspect_id)
     if not suspect:
         raise HTTPException(status_code=404, detail="용의자를 찾을 수 없습니다.")
 
-    # 🚨 V3 핵심: 증거 중복 제시 방지 로직
-    evidence_effect_text = "제시된 증거 없음."
+    # 범인 지목으로 끝난 게임은 더 심문하지 않음 (AI 사용량 낭비 방지)
+    if session.get("accuse", {}).get("finished"):
+        raise HTTPException(status_code=409, detail="이미 끝난 게임입니다. 새 게임을 시작하세요.")
+
     presented_evidence_id = req.presented_evidence_id
+    question_key = normalize_question(req.question)
+    if not question_key and not presented_evidence_id:
+        raise HTTPException(status_code=400, detail="질문을 입력하세요.")
+
+    # 🚨 V3 핵심: 증거 중복 제시 방지 로직
+    # 증거 관문: 질문·관계없는 증거로는 천장(pressure_cap)까지만 오르고, 핵심 증거를 내야 천장이 올라감
+    evidence_effect_text = "제시된 증거 없음."
+    capped_text = "말로는 더 이상 흔들리지 않습니다. 이 사람을 가리키는 증거가 있어야 더 몰아붙일 수 있습니다."
 
     if presented_evidence_id:
         if presented_evidence_id not in game["evidence_db"]:
@@ -348,7 +362,7 @@ def interrogate(req: InterrogateRequest):
                 evidence_effect_text = (
                     f"치명적인 증거 제시! "
                     f"압박도 +{impact}"
-                )   
+                )
             elif impact > 0:
                 evidence_effect_text = (
                     f"증거 제시. 압박도 +{impact}"
@@ -360,13 +374,21 @@ def interrogate(req: InterrogateRequest):
                     f"압박도 +{impact}"
                 )
 
-            suspect["pressure_level"] = min(
-                suspect["pressure_level"] + impact,
-                100
-            )
+            if presented_evidence_id in key_clues_for(game, req.suspect_id):
+                # 핵심 증거는 천장과 상관없이 오름 (제시 기록에 이미 들어가서 천장도 함께 올라감)
+                suspect["pressure_level"] = min(
+                    suspect["pressure_level"] + impact,
+                    100
+                )
+            else:
+                before = suspect["pressure_level"]
+                suspect["pressure_level"] = raise_pressure(
+                    before, impact, pressure_cap(game, req.suspect_id)
+                )
+                if suspect["pressure_level"] - before < impact:
+                    evidence_effect_text = f"{evidence_effect_text} (천장에 막힘) {capped_text}"
     else:
-        # 증거 없이 질문한 경우: 처음 하는 질문만 기본 압박도 증가
-        question_key = req.question.strip()
+        # 증거 없이 질문한 경우: 처음 하는 질문만 기본 압박도 증가 (천장까지만)
         if question_key in suspect["asked_questions"]:
             evidence_effect_text = (
                 "이미 했던 질문을 반복했습니다. "
@@ -374,12 +396,15 @@ def interrogate(req: InterrogateRequest):
             )
         else:
             suspect["asked_questions"].append(question_key)
-            suspect["pressure_level"] = min(
-                suspect["pressure_level"] + 5,
-                100
+            before = suspect["pressure_level"]
+            suspect["pressure_level"] = raise_pressure(
+                before, 5, pressure_cap(game, req.suspect_id)
             )
+            if suspect["pressure_level"] - before < 5:
+                evidence_effect_text = capped_text
 
     current_pressure = suspect["pressure_level"]
+    current_cap = pressure_cap(game, req.suspect_id)
 
     # 결정적 증거가 해당 용의자에게 실제로 제시되었는지 확인
     has_decisive_evidence = (
@@ -395,12 +420,19 @@ def interrogate(req: InterrogateRequest):
     ):
         suspect["confessed"] = True
 
+    # 질문 종류와 바이탈 리딩 (서버 규칙, AI 호출 없음)
+    category = resolve_category(req.question_category, req.question, presented_evidence_id)
+    vital = judge_vital(game, req.suspect_id, category, presented_evidence_id,
+                        current_pressure, suspect["confessed"])
+    # 질문으로는 더 못 올리는 상태 = 다음 단계로 가려면 증거가 필요함
+    need_evidence = current_pressure >= current_cap and not suspect["confessed"]
+
     # 같은 질문 반복: 압박 단계와 자백 상태가 그대로면 AI를 부르지 않고 이전 답변을 재사용
     # (증거를 내서 압박 단계가 바뀌었거나 자백했으면 태도가 달라져야 하므로 새로 생성)
     pressure_band = min(int(current_pressure) // 30, 3)   # 0~29 / 30~59 / 60~89 / 90~100
     cache_key = None
     if not presented_evidence_id:
-        cache_key = f"{req.question.strip()}|{pressure_band}|{suspect['confessed']}"
+        cache_key = f"{question_key}|{pressure_band}|{suspect['confessed']}"
         cached = suspect["answer_cache"].get(cache_key)
         if cached:
             return {
@@ -409,12 +441,18 @@ def interrogate(req: InterrogateRequest):
                 "emotion": cached["emotion"],
                 "pressure_level": current_pressure,
                 "is_confessed": suspect["confessed"],
-                "from_cache": True
+                "from_cache": True,
+                "question_category": category,
+                "vital": vital,
+                "pressure_cap": current_cap,
+                "need_evidence": need_evidence
             }
 
     # --- AI 대사 생성 (interrogation.py) ---
     # 사건 맥락 + 페르소나 + 진술 장부를 넣어 프롬프트를 만들고,
     # 서버 규칙으로 답변을 검사해 자백 누설·비밀 누설·근거 없는 시각을 막습니다. (문제 시 1번 재요청)
+    # 질문 종류를 상황 설명에 붙여 AI가 그 종류에 맞게 답하게 함
+    evidence_effect_text = f"[질문 종류: {category}] {evidence_effect_text}"
     result = generate_dialogue(
         client, MODEL_NAME, counted_call, game, req.suspect_id, req.question,
         presented_evidence_id, evidence_effect_text, current_pressure, suspect["confessed"],
@@ -436,7 +474,11 @@ def interrogate(req: InterrogateRequest):
         "emotion": result["emotion"],
         "pressure_level": current_pressure,
         "is_confessed": suspect["confessed"],
-        "from_cache": False
+        "from_cache": False,
+        "question_category": category,
+        "vital": vital,
+        "pressure_cap": current_cap,
+        "need_evidence": need_evidence
     }
 
 # --- 6. 최종 지목 API (에러 처리 완료) ---
@@ -445,23 +487,15 @@ def accuse_culprit(req: AccuseRequest):
     if req.game_id not in active_games:
         raise HTTPException(status_code=404, detail="존재하지 않는 게임입니다.")
 
-    game = active_games[req.game_id]["truth"]
+    session = active_games[req.game_id]
+    game = session["truth"]
+    if req.suspect_id not in game["suspects"]:
+        raise HTTPException(status_code=404, detail="용의자를 찾을 수 없습니다.")
 
-    is_correct_culprit = (req.suspect_id == game["culprit_id"])
-    is_decisive_evidence = (
-        req.decisive_evidence_id == game["decisive_evidence_id"]
-    )
-
-    if is_correct_culprit and is_decisive_evidence:
-        return {
-            "success": True,
-            "message": "진범 체포! 결정적 증거로 진범을 잡았습니다."
-        }
-    else:
-        return {
-            "success": False,
-            "message": "추리 실패. 진범이 빠져나갔거나 증거가 부족합니다."
-        }
+    # 범인 + 결정적 증거가 둘 다 맞아야 정답. 틀리면 힌트를 주고 기회가 남아 있는 한 다시 도전
+    # (예전 사건 세션처럼 accuse 상태가 없으면 새로 만듦)
+    accuse_state = session.setdefault("accuse", new_accuse_state())
+    return judge_accusation(game, accuse_state, req.suspect_id, req.decisive_evidence_id)
 
 
 # --- 7. 게임 상태 조회 API ---
@@ -481,7 +515,8 @@ def get_game_state(game_id: str):
         state_info["suspects"].append({
             "suspect_id": s_id,
             "pressure_level": s_data["pressure_level"],
-            "confessed": s_data["confessed"]
+            "confessed": s_data["confessed"],
+            "pressure_cap": pressure_cap(game, s_id)
         })
 
     return state_info

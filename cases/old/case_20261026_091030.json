@@ -1,0 +1,162 @@
+{
+  "title": "호텔 객실 추락사 사건",
+  "case_summary": "호텔에서 숙박 중인 남자를 살해하고 추락사로 위장한 살인 사건이 발생했다.",
+  "victim": "정원 (호텔 수신실 직원)",
+  "location": "호텔 레비아 호텔",
+  "time_of_death": "2026년 10월 15일 오후 2시",
+  "truth": "실제로 범인은 비즈니스 파트너 김민준이 호텔 객실에서 그를 살해한 것으로 증명됨.",
+  "culprit_id": 2,
+  "decisive_evidence_id": "E01",
+  "suspects": {
+    "1": {
+      "name": "지훈",
+      "job": "호텔 관리자",
+      "personality": "차분하고 권위적",
+      "description": "호텔 관리자로서 직원들을 이끄는 사람",
+      "alibi": "아침 7시에 회의에 참석하여 10시에 도착",
+      "knowledge": {
+        "public": [
+          "호텔 직무 관련"
+        ],
+        "private": [
+          "손님들과의 사적인 대화"
+        ],
+        "forbidden": [
+          "과거 개인적인 채무 문제"
+        ]
+      },
+      "evidence_effects": {
+        "E08": 35,
+        "E07": 25
+      },
+      "pressure_level": 0
+    },
+    "2": {
+      "name": "김민준",
+      "job": "비즈니스 파트너",
+      "personality": "성격이 강하고 도덕적",
+      "description": "정직한 비즈니스 파트너",
+      "alibi": "그날 밤 9시에 호텔 로비에서 잠든 상태",
+      "knowledge": {
+        "public": [
+          "비즈니스 관계"
+        ],
+        "private": [
+          "공식 회의 후 알리바이"
+        ],
+        "forbidden": [
+          "자신이 범인이라는 사실"
+        ]
+      },
+      "evidence_effects": {
+        "E01": 35,
+        "E02": 20,
+        "E03": 15,
+        "E08": 30
+      },
+      "pressure_level": 0
+    },
+    "3": {
+      "name": "서연",
+      "job": "보안 관장",
+      "personality": "예리하고 신비로운",
+      "description": "호텔 보안의 핵심 인물",
+      "alibi": "저녁 8시 30분에 휴게실에서 근무",
+      "knowledge": {
+        "public": [
+          "보안 업무"
+        ],
+        "private": [
+          "경쟁사 직원과의 부적절한 우정"
+        ],
+        "forbidden": [
+          "경쟁사의 비밀"
+        ]
+      },
+      "evidence_effects": {
+        "E05": 20,
+        "E11": 25
+      },
+      "pressure_level": 0
+    }
+  },
+  "evidence_db": {
+    "E01": {
+      "name": "주방 출입 기록",
+      "desc": "주방 문 개방 기록으로 객실 출입 빈도를 확인할 수 있는 기록",
+      "found_at": "호텔 레비아 호텔 주방",
+      "role": "결정적",
+      "related_suspect_id": 2
+    },
+    "E02": {
+      "name": "객실 침수 기록",
+      "desc": "객실 내 물 침수 흔적을 기록한 문서",
+      "found_at": "호텔 레비아 호텔 객실 305",
+      "role": "정황",
+      "related_suspect_id": 2
+    },
+    "E03": {
+      "name": "비밀 문자 추적",
+      "desc": "비밀 메시지 전화를 추적한 기록",
+      "found_at": "호텔 레비아 호텔 사무실",
+      "role": "모순",
+      "related_suspect_id": 2
+    },
+    "E04": {
+      "name": "화장실 청소 기록",
+      "desc": "화장실 청소 빈도와 시간 정보를 담은 기록",
+      "found_at": "호텔 레비아 호텔 화장실",
+      "role": "알리바이",
+      "related_suspect_id": 1
+    },
+    "E05": {
+      "name": "호텔 지표 기록",
+      "desc": "호텔 객실 청구 내역과 이용 기록",
+      "found_at": "호텔 레비아 호텔 접수처",
+      "role": "미스리드",
+      "related_suspect_id": 3
+    },
+    "E06": {
+      "name": "문서 보관 기록",
+      "desc": "일반 사용자 외에 누가 접근 가능한 비밀번호",
+      "found_at": "호텔 레비아 호텔 서버실",
+      "role": "정황",
+      "related_suspect_id": 2
+    },
+    "E07": {
+      "name": "통화 기록",
+      "desc": "호텔 객실 내 은밀한 통화 내용을 기록한 문자",
+      "found_at": "호텔 레비아 호텔 객실",
+      "role": "정황",
+      "related_suspect_id": 2
+    },
+    "E08": {
+      "name": "주방 비상 절차",
+      "desc": "주방 비상 대응 절차를 설명한 기록",
+      "found_at": "호텔 레비아 호텔 주방",
+      "role": "결정적",
+      "related_suspect_id": 2
+    },
+    "E09": {
+      "name": "보안 카메라 기록",
+      "desc": "호텔 내 이동 경로를 기록한 보안 카메라 영상",
+      "found_at": "호텔 레비아 호텔 보안실",
+      "role": "모순",
+      "related_suspect_id": 1
+    },
+    "E10": {
+      "name": "청소용품 사용 기록",
+      "desc": "청소용품 사용 시간과 위치를 기록한 장부",
+      "found_at": "호텔 레비아 호텔 운영실",
+      "role": "모순",
+      "related_suspect_id": 3
+    },
+    "E11": {
+      "name": "휴게실 출입 기록",
+      "desc": "휴게실 출입 카드 기록으로 근무 시간 확인 가능",
+      "found_at": "호텔 레비아 호텔 휴게실",
+      "role": "알리바이",
+      "related_suspect_id": 3
+    }
+  }
+}

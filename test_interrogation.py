@@ -11,7 +11,13 @@ from case_quality import check_case_quality, split_warnings
 from interrogation import check_dialogue, is_confession, tidy, generate_dialogue, build_system_prompt
 from persona import pick_preset
 
-CASE = load_case(Path(__file__).parent / "cases" / "case_20261025_215216.json")  # 범인 2 이준호
+def case_path(name: str) -> Path:
+    """테스트용 예전 사건은 cases/old로 옮겨졌을 수 있으므로 두 곳 다 찾음"""
+    base = Path(__file__).parent / "cases"
+    return base / name if (base / name).exists() else base / "old" / name
+
+
+CASE = load_case(case_path("case_20261025_215216.json"))  # 범인 2 이준호
 
 
 def fresh_game():
@@ -98,10 +104,10 @@ assert not r["ai_ok"] and "죽였" not in r["dialogue"], r
 print("테스트 10 통과: 위반 시 1번 재요청 → 실패 시 안전 대사")
 
 # 11. 사건 품질 검사기: 시작 압박도 75, 무고한 사람의 '자신이 범인' 감지
-bad = load_case(Path(__file__).parent / "cases" / "case_20261025_211252.json")
+bad = load_case(case_path("case_20261025_211252.json"))
 hard, _ = split_warnings(check_case_quality(bad))
 assert any("시작 압박도가 75" in e for e in hard)
-bad = load_case(Path(__file__).parent / "cases" / "case_20261025_210324.json")
+bad = load_case(case_path("case_20261025_210324.json"))
 hard, _ = split_warnings(check_case_quality(bad, expected_culprit_id=3))
 assert any("자신이 범인이라는 사실" in e for e in hard) and any("범인은 용의자 3" in e for e in hard)
 print("테스트 11 통과: 사건 품질 검사")
