@@ -8,9 +8,10 @@ VR 추리 심문 게임의 FastAPI 서버입니다. AI가 사건을 만들고, �
 | 파일 | 역할 |
 |---|---|
 | `main.py` | 서버 API, 게임 규칙(압박도·자백), 사건 선택, 자동 사건 보충 |
-| `game_rules.py` | 질문 카테고리, 증거 관문(압박도 천장), 바이탈 리딩, 범인 지목(오답 기회·힌트·등급) — AI 호출 없음 |
+| `game_rules.py` | 질문 카테고리, 증거 관문(압박도 천장), 바이탈 리딩, 범인 지목(오답 기회·힌트·등급), 현장 조사(구역) — AI 호출 없음 |
 | `interrogation.py` | 심문 AI 프롬프트 + 대답 검사(자백·비밀 누설, 근거 없는 시각) + 1번 재요청 |
 | `persona.py` | 용의자 말투 프리셋 5종 |
+| `question_bank.py` | 용의자별 카테고리 질문 목록 (사건별 AI 질문 + 질문 틀) — AI 호출 없음 |
 | `case_generator.py` | AI 사건 생성 → 형식 검사 → 품질 검사 → AI 검토 → `cases/`에 저장 |
 | `validator.py` / `case_quality.py` | 사건 형식 검사기 / 사건 내용 품질 검사기 |
 | `test_validator.py` / `test_interrogation.py` / `test_game_rules.py` | 테스트 (AI 호출 없음) |
@@ -45,7 +46,8 @@ VR 추리 심문 게임의 FastAPI 서버입니다. AI가 사건을 만들고, �
 
 | 메서드 | 경로 | 설명 | AI 호출 |
 |---|---|---|---|
-| POST | `/game/start` | 게임 시작 (아직 안 한 가장 새 사건 → 없으면 무작위 → 없으면 기본 호텔 사건) | 0 |
+| POST | `/game/start` | 게임 시작 (아직 안 한 가장 새 사건 → 없으면 무작위 → 없으면 기본 호텔 사건). 단서는 찾은 것만, 조사 구역 목록(`areas`), 사건 브리핑(`briefing`) | 0 |
+| POST | `/game/investigate` | 구역(`area_id`)을 조사해 그 구역의 단서를 찾음 | 0 |
 | POST | `/game/interrogate` | 질문·증거 제시. 같은 질문 반복(띄어쓰기·문장부호만 달라도)은 압박도 그대로, 이전 답변 재사용(`from_cache`). 빈 질문은 400, 끝난 게임은 409 | 0~2 |
 | GET | `/game/{game_id}/state` | 용의자 압박도·자백 상태 | 0 |
 | POST | `/game/accuse` | 범인 + 결정적 증거 판정. 틀리면 힌트를 주고 다시 도전 (3번 틀리면 미해결 엔딩) | 0 |
@@ -53,6 +55,31 @@ VR 추리 심문 게임의 FastAPI 서버입니다. AI가 사건을 만들고, �
 | POST | `/case/generate` | 사건 1개 생성 (몇 분 걸림) | 2~16 |
 | GET | `/case/list` | 저장된 사건 목록, 플레이 여부, 자동 생성 상태 | 0 |
 | GET | `/usage` | 오늘·최근 7일 AI 호출 횟수, OpenRouter 계정 정보 | 0 |
+
+### 카테고리별 질문 목록
+게임 시작 응답의 `questions`: `[{suspect_id: 1, categories: [{category: "관계", questions: [...]}, ...]}, ...]`
+- 카테고리는 `관계` / `알리바이` / `감정`, 카테고리마다 최대 6개
+- 1순위: 사건을 만들 때 AI가 쓴 용의자 맞춤 질문(`suspects[].questions`), 2순위: `question_bank.py`의 질문 틀에 피해자 이름·사망 추정 시각·다른 용의자를 채운 질문
+- 게임 중에 질문을 만들려고 AI를 부르지 않음 (질문 1번에 대답용 AI 1번은 그대로)
+- 질문을 보낼 때 `question_category`를 함께 보내면 바이탈 판정이 그 카테고리 기준으로 됨
+
+### 사건 브리핑
+게임 시작 응답의 `briefing`: `title`, `victim`, `location`, `time_of_death`, `text`(수사 브리핑 글), `suspects`("이름 (직업) - 소개" 목록)
+- 새로 만드는 사건은 AI가 `briefing`(3~5문장)을 함께 만들고, `case_quality.py`가 빈 글·정답 노출 단어·용의자 이름을 검사
+- 브리핑 글이 없는 사건은 `case_summary`로 대신함
+
+### 현장 조사 (구역별 단서 찾기)
+단서마다 조사 구역(`area`)이 있는 사건은 처음에 단서가 0개입니다. 구역을 조사해야 그 구역의 단서가 나옵니다.
+
+1. `POST /game/start` → `investigation: true`, `areas: [{area_id: "A1", name: "5층 테라스", investigated: false}, ...]`, `evidences: []`
+2. `POST /game/investigate` `{"game_id": "...", "area_id": "A1"}` → `message`, `found_evidences`(이 구역 단서), `evidences`(찾은 단서 전체), `areas`
+3. 이미 조사한 구역을 다시 조사하면 `already_investigated: true` (새 단서 없음)
+
+- 아직 못 찾은 단서를 심문에 내거나 지목에 쓰면 400 (오답 횟수에 넣지 않음)
+- 오답 힌트는 못 찾은 단서의 이름 대신 조사할 구역을 알려 줌
+- 구역이 없는 사건(예전 사건, 비상용 호텔 사건)은 `investigation: false`이고 처음부터 단서를 전부 공개
+- 새로 만드는 사건은 AI가 구역을 3~5개로 나누고, `case_quality.py`가 개수·사람 이름·결정적 단서 몰림을 검사
+- `GET /game/{game_id}/state`에 `found_evidence_ids`(찾은 단서 번호) 추가
 
 ### 증거 관문 (압박도 천장)
 질문만으로는 압박도를 끝까지 올릴 수 없습니다. 그 용의자를 가리키는 **핵심 증거**를 내야 천장이 올라갑니다.

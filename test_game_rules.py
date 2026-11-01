@@ -7,6 +7,7 @@
 import os
 import sys
 import copy
+import json
 from pathlib import Path
 
 sys.stdout.reconfigure(encoding="utf-8")
@@ -16,7 +17,10 @@ from fastapi.testclient import TestClient
 from case_generator import load_case
 from game_rules import (resolve_category, judge_vital, judge_accusation,
                         new_accuse_state, MAX_WRONG_ACCUSATIONS,
-                        normalize_question, key_clues_for, pressure_cap, raise_pressure)
+                        normalize_question, key_clues_for, pressure_cap, raise_pressure,
+                        new_investigation_state, investigate_area)
+from case_quality import check_case_quality, split_warnings
+from question_bank import question_list, MAX_QUESTIONS_PER_CATEGORY
 import main
 
 CASE_FILE = "case_20261026_165921.json"   # 범인 1번, 결정적 증거 E01
@@ -92,8 +96,17 @@ print("테스트 7 통과: 미해결 엔딩")
 # 테스트 8: 서버 API로 지목 (AI 호출 없는 경로) - 유니티가 쓰던 칸도 그대로 있는지
 main.mark_played = lambda file_path: None   # 테스트가 실제 사건 파일에 '플레이함'을 남기지 않게
 api = TestClient(main.app)
+
+
+def investigate_all(game_id, areas):
+    """모든 구역을 조사해 단서를 다 찾음 (조사와 상관없는 테스트용)"""
+    for a in areas:
+        api.post("/game/investigate", json={"game_id": game_id, "area_id": a["area_id"]})
+
+
 start = api.post(f"/game/start?case_file={CASE_FILE}").json()
 assert len(start["suspects"]) == 3 and start["game_id"]
+investigate_all(start["game_id"], start["areas"])
 r = api.post("/game/accuse", json={"game_id": start["game_id"], "suspect_id": 3,
                                    "decisive_evidence_id": "E07"}).json()
 assert {"success", "message"} <= r.keys() and r["success"] is False and r["game_over"] is False, r
@@ -122,7 +135,9 @@ print("테스트 9 통과: 증거 관문 규칙")
 # 테스트 10: 서버 API로 증거 관문 따라가기 (AI 대신 가짜 대사)
 main.generate_dialogue = lambda *args, **kwargs: {
     "dialogue": "모르겠어요.", "emotion": "calm", "ai_ok": True, "problems": [], "fixed": False}
-gid = api.post(f"/game/start?case_file={CASE_FILE}").json()["game_id"]
+start = api.post(f"/game/start?case_file={CASE_FILE}").json()
+gid = start["game_id"]
+investigate_all(gid, start["areas"])
 
 
 def ask(question, evidence=None, suspect=1):
@@ -157,5 +172,89 @@ api.post("/game/accuse", json={"game_id": gid, "suspect_id": 1, "decisive_eviden
 assert ask("한 가지만 더").status_code == 409                               # 끝난 게임은 심문 막음
 api.delete(f"/game/{gid}")
 print("테스트 10 통과: 증거 관문 API")
+
+# 테스트 11: 조사 구역 규칙
+c = fresh_case()
+inv = new_investigation_state(c)
+assert inv["enabled"] and inv["found"] == []
+assert [a["name"] for a in inv["areas"]] == ["5층 테라스", "신소재공학 연구실", "행정실·보안 기록", "검시 결과"]
+r = investigate_area(inv, "A1")
+assert not r["already"] and r["new_ids"] == ["E01", "E02", "E09"], r
+r = investigate_area(inv, "A1")
+assert r["already"] and r["new_ids"] == [], r
+assert investigate_area(inv, "A9") is None
+hotel = new_investigation_state(main.make_default_case())                  # 구역 없는 사건 → 처음부터 전부 공개
+assert not hotel["enabled"] and hotel["found"] == ["E01", "E02", "E03"]
+r = judge_accusation(c, new_accuse_state(), 2, "E04", found=["E04"])       # 못 찾은 알리바이 단서는 구역으로 힌트
+assert "「행정실·보안 기록」" in r["hint"] and "문서 파쇄실" not in r["hint"], r["hint"]
+assert not split_warnings(check_case_quality(c))[0]                         # 지금 사건은 품질 문제 없음
+for e in c["evidence_db"].values():
+    e["area"] = "5층 테라스"
+hard = split_warnings(check_case_quality(c))[0]
+assert any("조사 구역이 1개" in h for h in hard) and any("한 구역에" in h for h in hard), hard
+print("테스트 11 통과: 조사 구역 규칙")
+
+# 테스트 12: 조사 API
+start = api.post(f"/game/start?case_file={CASE_FILE}").json()
+gid = start["game_id"]
+assert start["evidences"] == [] and start["investigation"] is True, start
+assert [a["area_id"] for a in start["areas"]] == ["A1", "A2", "A3", "A4"]
+assert ask("이걸 보세요", "E01").status_code == 400                          # 못 찾은 단서 제시는 거절
+r = api.post("/game/accuse", json={"game_id": gid, "suspect_id": 1, "decisive_evidence_id": "E01"})
+assert r.status_code == 400                                                 # 못 찾은 단서로 지목도 거절
+r = api.post("/game/investigate", json={"game_id": gid, "area_id": "A1"}).json()
+assert [e["evidence_id"] for e in r["found_evidences"]] == ["E01", "E02", "E09"], r
+assert len(r["evidences"]) == 3 and "3개" in r["message"] and r["areas"][0]["investigated"], r
+assert "role" not in r["found_evidences"][0]                                # 역할 태그는 숨김
+r = api.post("/game/investigate", json={"game_id": gid, "area_id": "A1"}).json()
+assert r["already_investigated"] and "이미" in r["message"], r
+assert api.post("/game/investigate", json={"game_id": gid, "area_id": "A9"}).status_code == 404
+assert ask("이걸 보세요", "E01").status_code == 200                          # 찾은 뒤에는 제시 가능
+r = api.post("/game/accuse", json={"game_id": gid, "suspect_id": 1, "decisive_evidence_id": "E01"}).json()
+assert r["success"] and r["grade"] == "A", r                               # 거절된 지목은 오답 횟수에 안 들어감
+state = api.get(f"/game/{gid}/state").json()
+assert state["found_evidence_ids"] == ["E01", "E02", "E09"], state
+api.delete(f"/game/{gid}")
+print("테스트 12 통과: 조사 API")
+
+# 테스트 13: 사건 브리핑
+b = api.post(f"/game/start?case_file={CASE_FILE}").json()["briefing"]
+assert b["title"] == CASE["title"] and b["text"] == CASE["briefing"] and len(b["suspects"]) == 3, b
+assert b["suspects"][0].startswith("강도진 (박사과정 수석연구원) - "), b["suspects"]
+assert "role" not in json.dumps(b, ensure_ascii=False) and CASE["truth"] not in json.dumps(b, ensure_ascii=False)
+assert main.build_briefing(main.make_default_case())["text"] == main.make_default_case()["case_summary"]  # 브리핑 글 없으면 개요
+c = fresh_case()
+c["briefing"] = ""
+assert any("브리핑" in h for h in split_warnings(check_case_quality(c))[0])
+c["briefing"] = "강도진이 범인으로 보입니다."
+hard = split_warnings(check_case_quality(c))[0]
+assert any("'범인'" in h for h in hard) and any("강도진" in h for h in hard), hard
+print("테스트 13 통과: 사건 브리핑")
+
+# 테스트 14: 카테고리별 질문 목록 (질문 틀 + 사건별 AI 질문)
+c = fresh_case()
+lists = {x["category"]: x["questions"] for x in question_list(c, 1)}
+assert list(lists) == ["관계", "알리바이", "감정"]
+assert lists["관계"][0] == "서현우와는 어떤 사이였습니까?", lists["관계"]                  # 받침 없음 → 와
+assert "박태준과는 어떤 사이입니까?" in lists["관계"] and "윤세아와는 어떤 사이입니까?" in lists["관계"]
+assert "강도진" not in " ".join(lists["관계"])                                              # 자기 이름은 안 나옴
+assert lists["알리바이"][0] == "사건 당시(21:30 ~ 22:00)에 어디에 있었습니까?", lists["알리바이"]
+assert lists["감정"][0] == "서현우를 원망한 적이 있습니까?", lists["감정"]
+c["suspects"][1]["questions"] = [
+    {"category": "알리바이", "text": "컴퓨터실에서 논문을 고친 건 몇 시부터입니까?"},
+    {"category": "알리바이", "text": "그 시간에 무엇을 하고 있었습니까 ?"},               # 질문 틀과 겹침 → 한 번만
+]
+alibi = {x["category"]: x["questions"] for x in question_list(c, 1)}["알리바이"]
+assert alibi[0] == "컴퓨터실에서 논문을 고친 건 몇 시부터입니까?" and len(alibi) == MAX_QUESTIONS_PER_CATEGORY, alibi
+assert sum("무엇을 하고 있었습니까" in q for q in alibi) == 1, alibi
+hotel = {x["category"]: x["questions"] for x in question_list(main.make_default_case(), 2)}
+assert hotel["관계"][0] == "피해자와는 어떤 사이였습니까?" and hotel["알리바이"][0] == "사건 당시에 어디에 있었습니까?"
+qs = api.post(f"/game/start?case_file={CASE_FILE}").json()["questions"]
+assert [q["suspect_id"] for q in qs] == [1, 2, 3] and len(qs[0]["categories"]) == 3, qs
+c["suspects"][1]["questions"] = [{"category": "증거", "text": "E01 책상 위 메모는 뭡니까?"},
+                                 {"category": "감정", "text": "당신이 범인입니까?"}]
+hard = split_warnings(check_case_quality(c))[0]
+assert any("카테고리" in h for h in hard) and any("'범인'" in h for h in hard), hard
+print("테스트 14 통과: 질문 목록")
 
 print("\n모든 게임 규칙 테스트를 통과했습니다.")

@@ -19,6 +19,13 @@ SPOILER_WORDS = ROLE_WORDS + ("범인", "진범", "무고한", "함정", "용의
 # '자신이 범인'류 문장 (무고한 사람의 forbidden에 들어가면 안 됨)
 CULPRIT_SELF_PATTERN = re.compile(r"(자신이|내가|제가)\s*범인")
 
+# 용의자 맞춤 질문의 카테고리 (증거제시는 버튼으로 하므로 제외)
+QUESTION_CATEGORIES = ("관계", "알리바이", "감정")
+
+# 조사 구역 개수 규칙
+MIN_AREAS, MAX_AREAS = 3, 5
+MAX_CLUES_PER_AREA = 4
+
 # 한국어 품질: 한글 음절이 아닌 이상한 조합 / 반복 오타 패턴 (가벼운 휴리스틱)
 GARBLED_PATTERN = re.compile(r"[ㄱ-ㅎㅏ-ㅣ]{2,}|[\u4e00-\u9fff]|[\u3040-\u30ff]")
 
@@ -140,7 +147,58 @@ def check_case_quality(case: dict, expected_culprit_id: Optional[int] = None) ->
     if garbled:
         errors.append(f"깨진 글자나 외국 문자가 섞여 있습니다: {', '.join(garbled[:5])}")
 
-    # 12. 말투 정보 (persona.py가 쓰는 speech_style) - 없으면 경고만
+    # 12. 조사 구역(area): 3~5개, 구역당 단서 1~4개, 사람 이름 금지, 결정적 단서가 한 구역에 몰리면 안 됨
+    areas: dict[str, list[str]] = {}
+    for e_id, e in evidence_db.items():
+        area = str(e.get("area") or "").strip()
+        if not area:
+            errors.append(f"단서 {e_id}에 조사 구역(area)이 없습니다.")
+            continue
+        areas.setdefault(area, []).append(e_id)
+    if areas:
+        if not MIN_AREAS <= len(areas) <= MAX_AREAS:
+            errors.append(f"조사 구역이 {len(areas)}개입니다. {MIN_AREAS}~{MAX_AREAS}개여야 합니다.")
+        for area, ids in areas.items():
+            if len(ids) > MAX_CLUES_PER_AREA:
+                errors.append(f"조사 구역 '{area}'에 단서가 {len(ids)}개입니다. 한 구역에 {MAX_CLUES_PER_AREA}개까지입니다.")
+            for s in suspects.values():
+                if s.get("name") and s["name"] in area:
+                    errors.append(f"조사 구역 이름 '{area}'에 용의자 이름 '{s['name']}'이(가) 들어 있습니다.")
+        decisive_areas = {str(e.get("area") or "").strip() for e in evidence_db.values() if e.get("role") == "결정적"}
+        decisive_count = sum(1 for e in evidence_db.values() if e.get("role") == "결정적")
+        if decisive_count >= 2 and len(decisive_areas) == 1:
+            errors.append("결정적 단서가 모두 한 구역에 있습니다. 구역을 나눠야 조사하는 재미가 생깁니다.")
+
+    # 13. 수사 브리핑: 게임 시작 화면에 그대로 나가므로 비어 있거나 정답을 흘리면 안 됨
+    briefing = str(case.get("briefing") or "").strip()
+    if not briefing:
+        errors.append("수사 브리핑(briefing)이 비어 있습니다.")
+    else:
+        for w in SPOILER_WORDS:
+            if w in briefing:
+                errors.append(f"수사 브리핑에 '{w}'라는 단어가 있어 정답이 드러날 수 있습니다.")
+        for s_id, s in suspects.items():
+            if s.get("name") and s["name"] in briefing:
+                errors.append(f"수사 브리핑에 용의자 {s_id}의 이름 '{s['name']}'이(가) 들어 있습니다.")
+
+    # 14. 용의자 맞춤 질문: 없으면 질문 틀로 대신하므로 경고만. 정답·단서 이름을 흘리면 오류
+    clue_names = [str(e.get("name", "")) for e in evidence_db.values() if e.get("name")]
+    for s_id, s in suspects.items():
+        questions = s.get("questions") or []
+        if not questions:
+            errors.append(f"[경고] 용의자 {s_id}에게 맞춤 질문(questions)이 없습니다. 질문 틀로 대신합니다.")
+        for q in questions:
+            text = str(q.get("text", ""))
+            if q.get("category") not in QUESTION_CATEGORIES:
+                errors.append(f"용의자 {s_id}의 질문 '{text}'의 카테고리 '{q.get('category')}'는 관계/알리바이/감정이 아닙니다.")
+            for w in SPOILER_WORDS:
+                if w in text:
+                    errors.append(f"용의자 {s_id}의 질문 '{text}'에 '{w}'라는 단어가 있어 정답이 드러날 수 있습니다.")
+            for name in clue_names:
+                if name in text:
+                    errors.append(f"용의자 {s_id}의 질문 '{text}'에 아직 못 찾은 단서 이름 '{name}'이(가) 들어 있습니다.")
+
+    # 15. 말투 정보 (persona.py가 쓰는 speech_style) - 없으면 경고만
     for s_id, s in suspects.items():
         if not s.get("speech_style"):
             errors.append(f"[경고] 용의자 {s_id}에게 speech_style(말투 설정)이 없습니다. 기본 말투로 대체됩니다.")

@@ -12,7 +12,9 @@ from dotenv import load_dotenv
 from validator import validate_case, validate_generated_case
 from interrogation import generate_dialogue, build_user_message, remember
 from game_rules import (resolve_category, judge_vital, new_accuse_state, judge_accusation,
-                        normalize_question, key_clues_for, pressure_cap, raise_pressure)
+                        normalize_question, key_clues_for, pressure_cap, raise_pressure,
+                        new_investigation_state, public_areas, investigate_area)
+from question_bank import question_list
 from case_generator import generate_case, load_case, list_case_files, mark_played, MAX_ACTIVE_CASES
 from usage_counter import counted_call, get_usage
 
@@ -44,6 +46,10 @@ class AccuseRequest(BaseModel):
     game_id: str
     suspect_id: int
     decisive_evidence_id: str
+
+class InvestigateRequest(BaseModel):
+    game_id: str
+    area_id: str   # 게임 시작 응답의 areas에 있는 구역 번호 (A1, A2 ...)
 
 # 🚨 AI 응답을 깐깐하게 검증하기 위한 규격
 class NPCResponse(BaseModel):
@@ -200,9 +206,12 @@ def start_game(case_file: Optional[str] = None):
         )
 
     # 검증을 통과한 사건만 게임 세션에 등록
-    active_games[game_id] = {"truth": server_truth, "case_source": source, "accuse": new_accuse_state()}
+    investigation = new_investigation_state(server_truth)
+    active_games[game_id] = {"truth": server_truth, "case_source": source, "accuse": new_accuse_state(),
+                             "investigation": investigation}
 
     # 플레이어(Unity)에게는 공개 정보만 전달 (범인·역할 태그·비밀은 숨김)
+    # 구역이 있는 사건은 찾은 단서만 보냄(처음엔 0개). 구역이 없는 예전 사건은 처음부터 전부
     public_info = {
         "game_id": game_id,
         "case_title": server_truth.get("title", ""),
@@ -215,17 +224,85 @@ def start_game(case_file: Optional[str] = None):
             }
             for s_id, s in server_truth["suspects"].items()
         ],
-        "evidences": [
-            {
-                "evidence_id": e_id,
-                "name": e["name"],
-                "description": e.get("desc", "")
-            }
-            for e_id, e in server_truth["evidence_db"].items()
+        "evidences": public_evidences(server_truth, investigation["found"]),
+        "investigation": investigation["enabled"],
+        "areas": public_areas(investigation),
+        "briefing": build_briefing(server_truth),
+        # 용의자별 카테고리 질문 목록 (사건별 AI 질문 + 질문 틀, AI 호출 없음)
+        "questions": [
+            {"suspect_id": s_id, "categories": question_list(server_truth, s_id)}
+            for s_id in server_truth["suspects"]
         ]
     }
 
     return public_info
+
+
+def build_briefing(game: dict) -> dict:
+    """게임 시작 화면의 사건 브리핑 (공개 정보만). 브리핑 글이 없는 예전 사건은 개요로 대신함"""
+    return {
+        "title": game.get("title", ""),
+        "victim": game.get("victim", ""),
+        "location": game.get("location", ""),
+        "time_of_death": game.get("time_of_death", ""),
+        "text": game.get("briefing") or game.get("case_summary", ""),
+        "suspects": [
+            f"{s['name']} ({s['job']}) - {s.get('description', '')}" if s.get("job")
+            else f"{s['name']} - {s.get('description', '')}"
+            for s in game["suspects"].values()
+        ]
+    }
+
+
+def is_found(session: dict, evidence_id: str) -> bool:
+    """플레이어가 조사로 찾은 단서인지 (조사 기록이 없는 세션은 전부 찾은 것으로 봄)"""
+    investigation = session.get("investigation")
+    return investigation is None or evidence_id in investigation["found"]
+
+
+def public_evidences(game: dict, evidence_ids: list) -> list:
+    """Unity에 보내는 단서 정보 (이름·설명만, 역할 태그는 숨김)"""
+    return [
+        {
+            "evidence_id": e_id,
+            "name": game["evidence_db"][e_id]["name"],
+            "description": game["evidence_db"][e_id].get("desc", "")
+        }
+        for e_id in game["evidence_db"] if e_id in evidence_ids
+    ]
+
+
+# --- 3-1. 현장 조사 API (구역을 조사해 단서 찾기, AI 호출 없음) ---
+@app.post("/game/investigate")
+def investigate(req: InvestigateRequest):
+    if req.game_id not in active_games:
+        raise HTTPException(status_code=404, detail="존재하지 않는 게임입니다.")
+    session = active_games[req.game_id]
+    game = session["truth"]
+    investigation = session.setdefault("investigation", new_investigation_state(game))
+    if not investigation["enabled"]:
+        raise HTTPException(status_code=400, detail="이 사건은 조사 구역이 없습니다. 단서가 처음부터 모두 공개되어 있습니다.")
+    if session.get("accuse", {}).get("finished"):
+        raise HTTPException(status_code=409, detail="이미 끝난 게임입니다. 새 게임을 시작하세요.")
+
+    result = investigate_area(investigation, req.area_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="조사 구역을 찾을 수 없습니다.")
+
+    area = result["area"]
+    if result["already"]:
+        message = f"「{area['name']}」은(는) 이미 조사했습니다. 새로운 단서는 없습니다."
+    else:
+        message = f"「{area['name']}」에서 단서 {len(result['new_ids'])}개를 찾았습니다."
+    return {
+        "area_id": area["area_id"],
+        "area_name": area["name"],
+        "already_investigated": result["already"],
+        "message": message,
+        "found_evidences": public_evidences(game, area["evidence_ids"]),   # 이 구역의 단서
+        "evidences": public_evidences(game, investigation["found"]),       # 지금까지 찾은 단서 전체
+        "areas": public_areas(investigation)
+    }
 
 # --- 4. AI 사건 생성 API (생성 AI → 규칙 검사기 → 저장) ---
 @app.post("/case/generate")
@@ -343,6 +420,8 @@ def interrogate(req: InterrogateRequest):
                 status_code=400,
                 detail="존재하지 않는 증거 ID입니다."
             )
+        if not is_found(session, presented_evidence_id):
+            raise HTTPException(status_code=400, detail="아직 찾지 못한 단서입니다. 먼저 현장을 조사하세요.")
 
         if presented_evidence_id in suspect["presented_evidence"]:
             evidence_effect_text = (
@@ -492,10 +571,17 @@ def accuse_culprit(req: AccuseRequest):
     if req.suspect_id not in game["suspects"]:
         raise HTTPException(status_code=404, detail="용의자를 찾을 수 없습니다.")
 
+    # 아직 못 찾은 단서로는 지목할 수 없음 (오답 횟수에도 넣지 않음)
+    accuse_state = session.setdefault("accuse", new_accuse_state())
+    if req.decisive_evidence_id not in game["evidence_db"]:
+        raise HTTPException(status_code=400, detail="존재하지 않는 증거 ID입니다.")
+    if not accuse_state["finished"] and not is_found(session, req.decisive_evidence_id):
+        raise HTTPException(status_code=400, detail="아직 찾지 못한 단서입니다. 먼저 현장을 조사하세요.")
+
     # 범인 + 결정적 증거가 둘 다 맞아야 정답. 틀리면 힌트를 주고 기회가 남아 있는 한 다시 도전
     # (예전 사건 세션처럼 accuse 상태가 없으면 새로 만듦)
-    accuse_state = session.setdefault("accuse", new_accuse_state())
-    return judge_accusation(game, accuse_state, req.suspect_id, req.decisive_evidence_id)
+    found = session.get("investigation", {}).get("found")
+    return judge_accusation(game, accuse_state, req.suspect_id, req.decisive_evidence_id, found)
 
 
 # --- 7. 게임 상태 조회 API ---
@@ -504,11 +590,13 @@ def get_game_state(game_id: str):
     if game_id not in active_games:
         raise HTTPException(status_code=404, detail="존재하지 않는 게임입니다.")
 
-    game = active_games[game_id]["truth"]
+    session = active_games[game_id]
+    game = session["truth"]
 
     state_info = {
         "game_id": game_id,
-        "suspects": []
+        "suspects": [],
+        "found_evidence_ids": list(session.get("investigation", {}).get("found", game["evidence_db"]))
     }
 
     for s_id, s_data in game["suspects"].items():

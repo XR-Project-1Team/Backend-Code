@@ -5,6 +5,7 @@
 - 바이탈 리딩: 대답마다 정상 / 긴장 / 거짓 / 신호 공백 판정 (기획안 「마인드브레이크」의 레조넌스 고글)
 - 범인 지목: 오답 기회, 기각된 용의자, 서버가 만드는 힌트, 엔딩 등급
 - 증거 관문: 질문만으로 올릴 수 있는 압박도에 천장을 두고, 핵심 증거를 내야 천장이 올라감
+- 현장 조사: 단서를 구역(area)별로 묶고, 구역을 조사해야 그 단서를 쓸 수 있음
 
 판정은 사건의 진실(범인, 단서 역할)과 질문 종류만 보고 서버가 정합니다.
 AI가 지어내는 값이 아니라서 같은 상황이면 항상 같은 결과가 나옵니다.
@@ -146,17 +147,21 @@ def new_accuse_state() -> dict:
     return {"wrong_count": 0, "rejected_suspects": [], "finished": False, "result": None}
 
 
-def _hint_for_wrong(game: dict, suspect_id: int, evidence_id: str) -> str:
+def _hint_for_wrong(game: dict, suspect_id: int, evidence_id: str, found: Optional[list] = None) -> str:
     """틀린 이유에 맞춰 서버가 힌트를 만듦 (정답을 직접 말하지는 않음)"""
     culprit_id = game["culprit_id"]
     evidence_db = game["evidence_db"]
     name = game["suspects"].get(suspect_id, {}).get("name", f"용의자 {suspect_id}")
 
     if suspect_id != culprit_id:
-        alibi_clues = [e["name"] for e in evidence_db.values()
-                       if e.get("role") == "알리바이" and e.get("related_suspect_id") == suspect_id]
-        if alibi_clues:
-            return f"{name}의 알리바이를 뒷받침하는 단서가 있습니다. '{alibi_clues[0]}'를 다시 확인해 보세요."
+        alibi_ids = [e_id for e_id, e in evidence_db.items()
+                     if e.get("role") == "알리바이" and e.get("related_suspect_id") == suspect_id]
+        if alibi_ids:
+            clue = evidence_db[alibi_ids[0]]
+            if found is not None and alibi_ids[0] not in found and clue.get("area"):
+                # 아직 못 찾은 단서는 이름 대신 조사할 구역을 알려 줌
+                return f"{name}의 알리바이를 뒷받침하는 단서가 있습니다. 「{clue['area']}」을(를) 조사해 보세요."
+            return f"{name}의 알리바이를 뒷받침하는 단서가 있습니다. '{clue['name']}'를 다시 확인해 보세요."
         return f"{name}의 수상한 반응이 '어떤 질문'에서 나왔는지 다시 살펴보세요. 살인과 무관한 비밀일 수 있습니다."
 
     chosen = evidence_db.get(evidence_id)
@@ -165,10 +170,12 @@ def _hint_for_wrong(game: dict, suspect_id: int, evidence_id: str) -> str:
     return "범인은 맞습니다. 하지만 고른 단서가 이 사람과 직접 연결되지 않습니다."
 
 
-def judge_accusation(game: dict, accuse_state: dict, suspect_id: int, evidence_id: str) -> dict:
+def judge_accusation(game: dict, accuse_state: dict, suspect_id: int, evidence_id: str,
+                     found: Optional[list] = None) -> dict:
     """
     범인 + 결정적 증거가 둘 다 맞으면 정답. 틀리면 기회가 남아 있는 한 다시 도전.
     결과 칸: success, message, game_over, wrong_count, remaining_chances, rejected_suspects, hint, grade
+    found: 플레이어가 찾은 단서 ID 목록 (힌트에서 못 찾은 단서 이름을 말하지 않으려고 씀)
     """
     if accuse_state["finished"]:
         return {**accuse_state["result"], "message": "이미 끝난 게임입니다. 새 게임을 시작하세요."}
@@ -194,7 +201,7 @@ def judge_accusation(game: dict, accuse_state: dict, suspect_id: int, evidence_i
                 "success": False,
                 "message": f"기소 기각. 다시 추리하세요. (남은 기회 {remaining}번)",
                 "game_over": False,
-                "hint": _hint_for_wrong(game, suspect_id, evidence_id),
+                "hint": _hint_for_wrong(game, suspect_id, evidence_id, found),
                 "grade": "",
             }
         else:
@@ -215,3 +222,49 @@ def judge_accusation(game: dict, accuse_state: dict, suspect_id: int, evidence_i
         accuse_state["finished"] = True
         accuse_state["result"] = dict(result)
     return result
+
+
+# ---------------------------------------------------------------------------
+# 4. 현장 조사 (구역별 단서 찾기)
+# ---------------------------------------------------------------------------
+
+def has_areas(game: dict) -> bool:
+    """단서마다 구역(area)이 있는 사건만 조사 방식을 씀. 예전 사건은 처음부터 단서를 전부 공개"""
+    clues = list(game["evidence_db"].values())
+    return bool(clues) and all(str(e.get("area") or "").strip() for e in clues)
+
+
+def new_investigation_state(game: dict) -> dict:
+    """구역 목록(A1, A2 ... 단서에 처음 나온 순서)과 찾은 단서·조사한 구역 기록"""
+    if not has_areas(game):
+        return {"enabled": False, "areas": [], "found": list(game["evidence_db"]), "investigated": []}
+
+    areas = []
+    for e_id, e in game["evidence_db"].items():
+        name = e["area"].strip()
+        area = next((a for a in areas if a["name"] == name), None)
+        if not area:
+            area = {"area_id": f"A{len(areas) + 1}", "name": name, "evidence_ids": []}
+            areas.append(area)
+        area["evidence_ids"].append(e_id)
+    return {"enabled": True, "areas": areas, "found": [], "investigated": []}
+
+
+def public_areas(investigation: dict) -> list:
+    """Unity에 보내는 구역 목록 (어떤 단서가 있는지는 숨김)"""
+    return [{"area_id": a["area_id"], "name": a["name"],
+             "investigated": a["area_id"] in investigation["investigated"]}
+            for a in investigation["areas"]]
+
+
+def investigate_area(investigation: dict, area_id: str) -> Optional[dict]:
+    """구역을 조사해 그 구역의 단서를 찾음. 없는 구역이면 None"""
+    area = next((a for a in investigation["areas"] if a["area_id"] == area_id), None)
+    if not area:
+        return None
+    already = area_id in investigation["investigated"]
+    if not already:
+        investigation["investigated"].append(area_id)
+    new_ids = [e_id for e_id in area["evidence_ids"] if e_id not in investigation["found"]]
+    investigation["found"].extend(new_ids)
+    return {"area": area, "already": already, "new_ids": new_ids}

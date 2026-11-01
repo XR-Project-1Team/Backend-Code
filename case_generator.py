@@ -71,11 +71,21 @@ SYSTEM_PROMPT = f"""
 17. 범인을 가리키는 결정적·정황·모순 단서는 모두 범인의 evidence_effects에 넣고,
     무고한 사람을 의심하게 만드는 미스리드·모순 단서는 그 사람의 evidence_effects에 넣습니다.
 18. 세 용의자의 speech_style은 서로 확실히 다르게 만듭니다. (예: 격식체 냉정형 / 반말 섞인 다혈질형 / 말줄임표 많은 소심형)
+19. 단서마다 area(플레이어가 조사하는 구역)를 붙입니다. 구역은 3~5개이고 한 구역에 단서 1~4개를 넣습니다.
+    found_at이 비슷한 단서는 같은 구역으로 묶습니다. (예: '5층 테라스', '피해자 연구실', '보안 기록', '검시 결과')
+    구역 이름에는 사람 이름을 쓰지 않고, 결정적 단서를 모두 한 구역에 몰아넣지 않습니다.
+20. briefing은 게임을 시작할 때 형사(플레이어)에게 보여 주는 수사 브리핑 3~5문장입니다.
+    발견 경위, 현장 상황, 형사가 할 일(현장 조사와 심문)을 씁니다.
+    용의자 이름, 숨긴 비밀, 단서 역할, 범인을 짐작하게 하는 내용은 쓰지 않습니다.
+21. 용의자마다 questions 4~6개를 만듭니다. 형사가 그 사람에게 물어볼 만한 맞춤 질문입니다.
+    category는 "관계", "알리바이", "감정" 중 하나이고, 세 카테고리를 골고루 씁니다.
+    질문은 공개 정보(description, alibi, public)만 근거로 하고, 단서 이름·숨긴 비밀·범인 여부를 직접 묻지 않습니다.
 
 [JSON 구조]
 {{
   "title": "사건 제목",
   "case_summary": "플레이어에게 보여 줄 사건 개요 1~2문장",
+  "briefing": "게임 시작 때 보여 줄 수사 브리핑 3~5문장",
   "victim": "피해자 이름과 신분",
   "location": "사건 장소",
   "time_of_death": "사망 추정 시각",
@@ -102,7 +112,10 @@ SYSTEM_PROMPT = f"""
       "private": ["숨기는 비밀"],
       "forbidden": ["절대 말하면 안 되는 정보"],
       "evidence_effects": {{"E03": 20}},
-      "pressure_level": 0
+      "pressure_level": 0,
+      "questions": [
+        {{"category": "알리바이", "text": "이 사람에게 물어볼 맞춤 질문"}}
+      ]
     }}
   ],
   "evidences": [
@@ -111,6 +124,7 @@ SYSTEM_PROMPT = f"""
       "name": "단서 이름",
       "desc": "단서 설명",
       "found_at": "발견 장소",
+      "area": "조사 구역",
       "role": "결정적",
       "related_suspect_id": 1
     }}
@@ -170,6 +184,10 @@ def to_server_truth(raw: dict) -> dict:
                 str(e_id): v for e_id, v in (s.get("evidence_effects") or {}).items()
             },
             "pressure_level": s.get("pressure_level", 0),
+            "questions": [
+                {"category": str(q.get("category", "")).strip(), "text": str(q.get("text", "")).strip()}
+                for q in (s.get("questions") or []) if isinstance(q, dict)
+            ],
         }
 
     evidence_db = {}
@@ -179,6 +197,7 @@ def to_server_truth(raw: dict) -> dict:
             "name": e.get("name", ""),
             "desc": e.get("desc", ""),
             "found_at": e.get("found_at", ""),
+            "area": e.get("area", ""),
             "role": e.get("role", ""),
             "related_suspect_id": int(related) if related is not None else None,
         }
@@ -186,6 +205,7 @@ def to_server_truth(raw: dict) -> dict:
     return {
         "title": raw.get("title", ""),
         "case_summary": raw.get("case_summary", ""),
+        "briefing": raw.get("briefing", ""),
         "victim": raw.get("victim", ""),
         "location": raw.get("location", ""),
         "time_of_death": raw.get("time_of_death", ""),
