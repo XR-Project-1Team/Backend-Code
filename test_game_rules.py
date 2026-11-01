@@ -20,7 +20,8 @@ from game_rules import (resolve_category, judge_vital, judge_accusation,
                         normalize_question, key_clues_for, pressure_cap, raise_pressure,
                         new_investigation_state, investigate_area)
 from case_quality import check_case_quality, split_warnings
-from question_bank import question_list, MAX_QUESTIONS_PER_CATEGORY
+from question_bank import question_list, clue_questions, MAX_QUESTIONS_PER_CATEGORY
+from interrogation import check_dialogue
 import main
 
 CASE_FILE = "case_20261026_165921.json"   # 범인 1번, 결정적 증거 E01
@@ -157,10 +158,12 @@ assert r["pressure_level"] == 44 and r["pressure_cap"] == 59, r
 for i in range(10, 20):
     r = ask(f"질문 {i}").json()
 assert r["pressure_level"] == 59, r
-r = ask("이건요?", "E05").json()                                             # 남의 알리바이 단서 +2 → 천장에 막힘
-assert r["pressure_level"] == 59, r
+r = ask("이건요?", "E05").json()                                             # 남의 알리바이 단서 = 헛짚기 -5
+assert r["pressure_level"] == 59 - main.WRONG_EVIDENCE_PENALTY, r
+r = ask("이건요?", "E05").json()                                             # 같은 증거를 다시 내밀면 변화 없음
+assert r["pressure_level"] == 54, r
 r = ask("이건요?", "E03").json()                                             # 모순 +20
-assert r["pressure_level"] == 79 and r["pressure_cap"] == 89, r
+assert r["pressure_level"] == 74 and r["pressure_cap"] == 89, r
 for i in range(20, 30):
     r = ask(f"질문 {i}").json()
 assert r["pressure_level"] == 89 and not r["is_confessed"], r              # 90은 질문으로 못 넘음
@@ -256,5 +259,39 @@ c["suspects"][1]["questions"] = [{"category": "증거", "text": "E01 책상 위 
 hard = split_warnings(check_case_quality(c))[0]
 assert any("카테고리" in h for h in hard) and any("'범인'" in h for h in hard), hard
 print("테스트 14 통과: 질문 목록")
+
+# 테스트 15: 단서 질문 (찾은 단서를 말로 떠보기)
+c = fresh_case()
+assert clue_questions(c, ["E05"]) == [{"clue_id": "E05", "text": CASE["evidence_db"]["E05"]["question"]}]
+c["evidence_db"]["E05"]["question"] = ""
+assert clue_questions(c, ["E05"])[0]["text"] == "「문서 파쇄실 출입 기록표」에 대해 들은 적이 있습니까?"   # 질문 없으면 틀
+c = fresh_case()
+assert judge_vital(c, 1, "단서", "E01", 10, False) == "긴장"     # 범인 + 자기를 가리키는 단서, 압박 낮음
+assert judge_vital(c, 1, "단서", "E01", 40, False) == "거짓"     # 압박 30 이상
+assert judge_vital(c, 1, "단서", "E05", 40, False) == "정상"     # 남의 알리바이 단서
+assert judge_vital(c, 2, "단서", "E04", 10, False) == "긴장"     # 무고한 사람의 비밀은 말로는 긴장까지
+assert judge_vital(c, 2, "단서", "E05", 10, False) == "정상"
+q = CASE["evidence_db"]["E08"]["question"]
+assert check_dialogue(c, 1, "그 분석서가 뭐 어쨌다는 겁니까?", q, None, False)          # 형사가 안 꺼낸 결정적 증거를 먼저 말함
+assert not check_dialogue(c, 1, "그 분석서가 뭐 어쨌다는 겁니까?", q, None, False, "E08")  # 형사가 말로 꺼냈으면 허용
+start = api.post(f"/game/start?case_file={CASE_FILE}").json()
+gid = start["game_id"]
+assert start["clue_questions"] == [], start["clue_questions"]
+r = api.post("/game/interrogate", json={"game_id": gid, "suspect_id": 1, "question": "아무 질문", "clue_id": "E01"})
+assert r.status_code == 400                                                  # 못 찾은 단서로는 질문 못 함
+r = api.post("/game/investigate", json={"game_id": gid, "area_id": "A1"}).json()
+assert [q["clue_id"] for q in r["new_clue_questions"]] == ["E01", "E02", "E09"], r["new_clue_questions"]
+assert len(r["clue_questions"]) == 3
+r = api.post("/game/investigate", json={"game_id": gid, "area_id": "A1"}).json()
+assert r["new_clue_questions"] == [] and len(r["clue_questions"]) == 3       # 다시 조사해도 새 질문 없음
+q = CASE["evidence_db"]["E01"]["question"]
+r = api.post("/game/interrogate", json={"game_id": gid, "suspect_id": 1, "question": q, "clue_id": "E01"}).json()
+assert r["question_category"] == "단서" and r["vital"] == "긴장" and r["pressure_level"] == 5, r   # 말로 묻기는 +5
+api.delete(f"/game/{gid}")
+c = fresh_case()
+c["evidence_db"]["E01"]["question"] = "범인은 장갑을 꼈습니까?"
+assert any("E01의 질문" in h for h in split_warnings(check_case_quality(c))[0])
+assert not split_warnings(check_case_quality(fresh_case()))[0]               # 지금 사건은 문제 없음
+print("테스트 15 통과: 단서 질문")
 
 print("\n모든 게임 규칙 테스트를 통과했습니다.")

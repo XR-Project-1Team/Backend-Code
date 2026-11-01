@@ -72,6 +72,22 @@ def template_questions(game: dict, suspect_id: int) -> dict:
             for category, templates in QUESTION_TEMPLATES.items()}
 
 
+def clue_questions(game: dict, evidence_ids: list) -> list:
+    """
+    찾은 단서마다 열리는 '단서 질문' (단서를 보여 주지 않고 말로 떠보기). 세 용의자 누구에게나 물을 수 있음
+    1순위: 사건을 만들 때 AI가 단서마다 써 둔 질문, 2순위: 질문 틀
+    [{"clue_id": "E01", "text": "..."}, ...]
+    """
+    result = []
+    for e_id in evidence_ids:
+        clue = game["evidence_db"].get(e_id)
+        if not clue:
+            continue
+        text = str(clue.get("question") or "").strip() or f"「{clue.get('name', e_id)}」에 대해 들은 적이 있습니까?"
+        result.append({"clue_id": e_id, "text": text})
+    return result
+
+
 def question_list(game: dict, suspect_id: int) -> list:
     """
     Unity에 보내는 한 용의자의 질문 목록

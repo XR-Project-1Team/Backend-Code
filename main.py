@@ -12,9 +12,9 @@ from dotenv import load_dotenv
 from validator import validate_case, validate_generated_case
 from interrogation import generate_dialogue, build_user_message, remember
 from game_rules import (resolve_category, judge_vital, new_accuse_state, judge_accusation,
-                        normalize_question, key_clues_for, pressure_cap, raise_pressure,
+                        normalize_question, key_clues_for, pressure_cap, raise_pressure, WRONG_EVIDENCE_PENALTY,
                         new_investigation_state, public_areas, investigate_area)
-from question_bank import question_list
+from question_bank import question_list, clue_questions
 from case_generator import generate_case, load_case, list_case_files, mark_played, MAX_ACTIVE_CASES
 from usage_counter import counted_call, get_usage
 
@@ -41,6 +41,7 @@ class InterrogateRequest(BaseModel):
     question: str
     presented_evidence_id: Optional[str] = None
     question_category: Optional[str] = None   # 관계 / 알리바이 / 감정 / 증거제시 (없으면 서버가 짐작)
+    clue_id: Optional[str] = None             # 단서 질문이면 말로 꺼낸 단서 ID (증거를 보여 주지는 않음)
 
 class AccuseRequest(BaseModel):
     game_id: str
@@ -232,7 +233,9 @@ def start_game(case_file: Optional[str] = None):
         "questions": [
             {"suspect_id": s_id, "categories": question_list(server_truth, s_id)}
             for s_id in server_truth["suspects"]
-        ]
+        ],
+        # 찾은 단서의 '단서 질문' (조사 방식 사건은 처음엔 0개, 구역을 조사하면 열림)
+        "clue_questions": clue_questions(server_truth, investigation["found"])
     }
 
     return public_info
@@ -301,7 +304,9 @@ def investigate(req: InvestigateRequest):
         "message": message,
         "found_evidences": public_evidences(game, area["evidence_ids"]),   # 이 구역의 단서
         "evidences": public_evidences(game, investigation["found"]),       # 지금까지 찾은 단서 전체
-        "areas": public_areas(investigation)
+        "areas": public_areas(investigation),
+        "new_clue_questions": clue_questions(game, result["new_ids"]),     # 이번에 새로 열린 단서 질문
+        "clue_questions": clue_questions(game, investigation["found"])     # 지금까지 열린 단서 질문 전체
     }
 
 # --- 4. AI 사건 생성 API (생성 AI → 규칙 검사기 → 저장) ---
@@ -409,6 +414,14 @@ def interrogate(req: InterrogateRequest):
     if not question_key and not presented_evidence_id:
         raise HTTPException(status_code=400, detail="질문을 입력하세요.")
 
+    # 단서 질문: 찾은 단서를 보여 주지 않고 말로 꺼냄 (증거를 함께 내면 증거 제시로 처리)
+    clue_id = req.clue_id if req.clue_id and not presented_evidence_id else None
+    if clue_id:
+        if clue_id not in game["evidence_db"]:
+            raise HTTPException(status_code=400, detail="존재하지 않는 단서 ID입니다.")
+        if not is_found(session, clue_id):
+            raise HTTPException(status_code=400, detail="아직 찾지 못한 단서입니다. 먼저 현장을 조사하세요.")
+
     # 🚨 V3 핵심: 증거 중복 제시 방지 로직
     # 증거 관문: 질문·관계없는 증거로는 천장(pressure_cap)까지만 오르고, 핵심 증거를 내야 천장이 올라감
     evidence_effect_text = "제시된 증거 없음."
@@ -437,6 +450,7 @@ def interrogate(req: InterrogateRequest):
                 presented_evidence_id, 0
             )
 
+            is_key_clue = presented_evidence_id in key_clues_for(game, req.suspect_id)
             if impact > 20:
                 evidence_effect_text = (
                     f"치명적인 증거 제시! "
@@ -446,19 +460,28 @@ def interrogate(req: InterrogateRequest):
                 evidence_effect_text = (
                     f"증거 제시. 압박도 +{impact}"
                 )
-            else:
+            elif is_key_clue:
                 impact = 2
                 evidence_effect_text = (
                     f"관련성이 낮은 증거 제시. "
                     f"압박도 +{impact}"
                 )
+            else:
+                # 헛짚기: 이 사람과 상관없는 증거 → 압박도가 내려감 (단서 질문으로 먼저 떠보게 하려는 장치)
+                impact = -WRONG_EVIDENCE_PENALTY
+                evidence_effect_text = (
+                    f"이 사람과 상관없는 증거를 내밀었습니다. 압박도 {impact}. "
+                    "'그게 저랑 무슨 상관이죠?' 하며 여유를 되찾으십시오."
+                )
 
-            if presented_evidence_id in key_clues_for(game, req.suspect_id):
+            if is_key_clue:
                 # 핵심 증거는 천장과 상관없이 오름 (제시 기록에 이미 들어가서 천장도 함께 올라감)
                 suspect["pressure_level"] = min(
                     suspect["pressure_level"] + impact,
                     100
                 )
+            elif impact < 0:
+                suspect["pressure_level"] = max(suspect["pressure_level"] + impact, 0)
             else:
                 before = suspect["pressure_level"]
                 suspect["pressure_level"] = raise_pressure(
@@ -500,8 +523,8 @@ def interrogate(req: InterrogateRequest):
         suspect["confessed"] = True
 
     # 질문 종류와 바이탈 리딩 (서버 규칙, AI 호출 없음)
-    category = resolve_category(req.question_category, req.question, presented_evidence_id)
-    vital = judge_vital(game, req.suspect_id, category, presented_evidence_id,
+    category = "단서" if clue_id else resolve_category(req.question_category, req.question, presented_evidence_id)
+    vital = judge_vital(game, req.suspect_id, category, presented_evidence_id or clue_id,
                         current_pressure, suspect["confessed"])
     # 질문으로는 더 못 올리는 상태 = 다음 단계로 가려면 증거가 필요함
     need_evidence = current_pressure >= current_cap and not suspect["confessed"]
@@ -535,6 +558,7 @@ def interrogate(req: InterrogateRequest):
     result = generate_dialogue(
         client, MODEL_NAME, counted_call, game, req.suspect_id, req.question,
         presented_evidence_id, evidence_effect_text, current_pressure, suspect["confessed"],
+        mentioned_clue_id=clue_id,
     )
     if result["problems"]:
         print(f"[심문 검사] 용의자 {req.suspect_id}: {result['problems']}")
@@ -545,7 +569,8 @@ def interrogate(req: InterrogateRequest):
             "emotion": result["emotion"]
         }
     # 대화 기록 + 진술 장부 업데이트 (서버 메모리에 저장)
-    user_message = build_user_message(game, req.question, presented_evidence_id, evidence_effect_text)
+    user_message = build_user_message(game, req.question, presented_evidence_id, evidence_effect_text,
+                                      mentioned_clue_id=clue_id)
     remember(suspect, user_message, result["dialogue"], result["emotion"])
     return {
         "suspect_id": req.suspect_id,

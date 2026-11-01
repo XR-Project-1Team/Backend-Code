@@ -80,6 +80,9 @@ SYSTEM_PROMPT = f"""
 21. 용의자마다 questions 4~6개를 만듭니다. 형사가 그 사람에게 물어볼 만한 맞춤 질문입니다.
     category는 "관계", "알리바이", "감정" 중 하나이고, 세 카테고리를 골고루 씁니다.
     질문은 공개 정보(description, alibi, public)만 근거로 하고, 단서 이름·숨긴 비밀·범인 여부를 직접 묻지 않습니다.
+22. 단서마다 question 1개를 만듭니다. 플레이어가 그 단서를 찾은 뒤 실물을 보여 주지 않고 말로 떠보는 질문입니다.
+    (예: '문서 파쇄실 출입 기록표' → "그날 밤 1층 문서 파쇄실 세단기를 누가 쓰고 있었는지 압니까?")
+    세 용의자 누구에게 물어도 어색하지 않게 쓰고, 범인 이름과 역할 이름은 쓰지 않습니다.
 
 [JSON 구조]
 {{
@@ -125,6 +128,7 @@ SYSTEM_PROMPT = f"""
       "desc": "단서 설명",
       "found_at": "발견 장소",
       "area": "조사 구역",
+      "question": "단서를 찾은 뒤 말로 떠보는 질문",
       "role": "결정적",
       "related_suspect_id": 1
     }}
@@ -198,6 +202,7 @@ def to_server_truth(raw: dict) -> dict:
             "desc": e.get("desc", ""),
             "found_at": e.get("found_at", ""),
             "area": e.get("area", ""),
+            "question": e.get("question", ""),
             "role": e.get("role", ""),
             "related_suspect_id": int(related) if related is not None else None,
         }

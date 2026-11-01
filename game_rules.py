@@ -13,7 +13,7 @@ AI가 지어내는 값이 아니라서 같은 상황이면 항상 같은 결과�
 import re
 from typing import Optional
 
-QUESTION_CATEGORIES = ("관계", "알리바이", "감정", "증거제시")
+QUESTION_CATEGORIES = ("관계", "알리바이", "감정", "증거제시", "단서")   # 단서 = 찾은 단서를 말로 떠보는 질문
 
 # 질문 문장으로 종류를 짐작할 때 쓰는 단어 (Unity가 종류를 보내지 않을 때만 사용)
 CATEGORY_KEYWORDS = {
@@ -34,6 +34,9 @@ GRADE_BY_WRONG = {0: "A", 1: "B", 2: "C"}
 # 그 사람에게 낸 핵심 증거가 0 / 1 / 2개 이상일 때 질문으로 올릴 수 있는 최대 압박도
 # (말투 단계 0~29 여유 / 30~59 방어 / 60~89 흔들림 / 90~ 붕괴의 끝값. 90 이상은 증거로만)
 PRESSURE_CAP_BY_KEY_CLUES = (29, 59, 89)
+
+# 헛짚기: 그 사람과 상관없는 증거(압박도 표에도 없고 핵심 단서도 아님)를 내밀면 압박도가 이만큼 내려감
+WRONG_EVIDENCE_PENALTY = 5
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +106,8 @@ def judge_vital(game: dict, suspect_id: int, category: str, evidence_id: Optiona
     - 범인은 알리바이·감정에서 긴장하다가, 자기를 가리키는 증거 앞에서 거짓 반응
     - 무고한 사람도 개인 비밀(미스리드·모순 단서)을 건드리면 거짓 반응 → 레드헤링
     - 사건에 "culprit_unaware": true 가 있으면 범인은 거짓 대신 신호 공백 (범인 본인도 모르는 사건)
+    - 단서 질문(말로 떠보기)은 증거 제시보다 약한 신호: 범인은 압박도 30부터 거짓, 무고한 사람은 긴장까지
+      (단서 질문일 때 evidence_id는 말로 꺼낸 단서 ID)
     """
     suspect = game["suspects"][suspect_id]
     is_culprit = suspect_id == game["culprit_id"]
@@ -117,6 +122,11 @@ def judge_vital(game: dict, suspect_id: int, category: str, evidence_id: Optiona
     if is_culprit:
         if category == "증거제시":
             state = "거짓" if about_me and clue.get("role") in CULPRIT_CLUE_ROLES else "긴장"
+        elif category == "단서":
+            if about_me and clue.get("role") in CULPRIT_CLUE_ROLES:
+                state = "긴장" if pressure < 30 else "거짓"
+            else:
+                state = "정상"
         elif category == "알리바이":
             state = "긴장" if pressure < 60 else "거짓"
         elif category == "감정":
@@ -132,6 +142,8 @@ def judge_vital(game: dict, suspect_id: int, category: str, evidence_id: Optiona
         if about_me and clue.get("role") in SECRET_CLUE_ROLES:
             return "거짓"      # 살인과 무관한 개인 비밀을 숨김
         return "정상"
+    if category == "단서":
+        return "긴장" if about_me and clue.get("role") in SECRET_CLUE_ROLES else "정상"
     if category == "감정":
         return "긴장" if pressure >= 30 or has_secret else "정상"
     if category == "관계":

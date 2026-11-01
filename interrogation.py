@@ -97,22 +97,29 @@ def build_system_prompt(game: dict, suspect_id: int, pressure: int, confessed: b
 {{"dialogue": "캐릭터 대사", "emotion": "calm"}}"""
 
 
-def build_user_message(game: dict, question: str, evidence_id: Optional[str], effect_text: str) -> str:
+def build_user_message(game: dict, question: str, evidence_id: Optional[str], effect_text: str,
+                       mentioned_clue_id: Optional[str] = None) -> str:
     """기존 코드는 '증거 제시. 압박도 +35'만 보내서 AI가 무슨 증거인지 몰랐음 → 증거 이름·설명을 함께 보냄"""
     lines = [f"형사 질문: {question}"]
     if evidence_id and evidence_id in game["evidence_db"]:
         e = game["evidence_db"][evidence_id]
         lines.append(f"형사가 내민 증거: [{e['name']}] {e.get('desc', '')}")
+    elif mentioned_clue_id and mentioned_clue_id in game["evidence_db"]:
+        # 단서 질문: 형사가 단서를 보여 주지 않고 말로만 꺼냄 (설명은 주지 않아 용의자가 모르는 사실을 알게 되지 않음)
+        e = game["evidence_db"][mentioned_clue_id]
+        lines.append(f"형사가 말로 꺼낸 단서 (실물은 보여 주지 않음): [{e['name']}]")
     lines.append(f"상황: {effect_text}")
     return "\n".join(lines)
 
 
 def build_messages(game: dict, suspect_id: int, question: str, evidence_id: Optional[str],
-                   effect_text: str, pressure: int, confessed: bool) -> list:
+                   effect_text: str, pressure: int, confessed: bool,
+                   mentioned_clue_id: Optional[str] = None) -> list:
     suspect = game["suspects"][suspect_id]
     messages = [{"role": "system", "content": build_system_prompt(game, suspect_id, pressure, confessed)}]
     messages += suspect.get("chat_log", [])[-4:]
-    messages.append({"role": "user", "content": build_user_message(game, question, evidence_id, effect_text)})
+    messages.append({"role": "user", "content": build_user_message(game, question, evidence_id, effect_text,
+                                                                   mentioned_clue_id)})
     return messages
 
 
@@ -164,8 +171,9 @@ def _keywords(sentence: str) -> list[str]:
 
 
 def check_dialogue(game: dict, suspect_id: int, dialogue: str, question: str,
-                   evidence_id: Optional[str], confessed: bool) -> list[str]:
-    """대사의 규칙 위반 목록. 빈 리스트면 통과."""
+                   evidence_id: Optional[str], confessed: bool,
+                   mentioned_clue_id: Optional[str] = None) -> list[str]:
+    """대사의 규칙 위반 목록. 빈 리스트면 통과. mentioned_clue_id: 형사가 말로 먼저 꺼낸 단서"""
     problems = []
     suspect = game["suspects"][suspect_id]
     is_culprit = suspect_id == game["culprit_id"]
@@ -184,9 +192,10 @@ def check_dialogue(game: dict, suspect_id: int, dialogue: str, question: str,
             if len(keys) >= 2 and sum(1 for w in keys if w in dialogue) / len(keys) >= 0.6:
                 problems.append(f"절대 말하면 안 되는 비밀('{item}')을 말했습니다. 그 내용은 빼십시오.")
 
-        # (3) 범인만 아는 사실: 보여 주지 않은 결정적 증거를 먼저 언급
+        # (3) 범인만 아는 사실: 보여 주지 않은 결정적 증거를 먼저 언급 (형사가 말로 먼저 꺼낸 단서는 예외)
         if is_culprit:
-            shown = set(suspect.get("presented_evidence", [])) | ({evidence_id} if evidence_id else set())
+            shown = (set(suspect.get("presented_evidence", []))
+                     | {e for e in (evidence_id, mentioned_clue_id) if e})
             for e_id, e in game["evidence_db"].items():
                 if e.get("role") == "결정적" and e_id not in shown:
                     core = e["name"].split()[-1]
@@ -275,7 +284,7 @@ def _call(client, model: str, messages: list, counted_call) -> dict:
 
 def generate_dialogue(client, model: str, counted_call, game: dict, suspect_id: int, question: str,
                       evidence_id: Optional[str], effect_text: str, pressure: int, confessed: bool,
-                      max_fix: int = 1) -> dict:
+                      max_fix: int = 1, mentioned_clue_id: Optional[str] = None) -> dict:
     """
     결과: {"dialogue", "emotion", "ai_ok", "fixed", "problems"}
       ai_ok    : AI 답변을 그대로(또는 고쳐서) 썼는지. False면 안전 대사
@@ -284,7 +293,8 @@ def generate_dialogue(client, model: str, counted_call, game: dict, suspect_id: 
     """
     suspect = game["suspects"][suspect_id]
     is_culprit = suspect_id == game["culprit_id"]
-    messages = build_messages(game, suspect_id, question, evidence_id, effect_text, pressure, confessed)
+    messages = build_messages(game, suspect_id, question, evidence_id, effect_text, pressure, confessed,
+                              mentioned_clue_id)
     problems: list[str] = []
     for attempt in range(max_fix + 1):
         try:
@@ -293,7 +303,7 @@ def generate_dialogue(client, model: str, counted_call, game: dict, suspect_id: 
             problems = [f"AI 호출 실패: {type(e).__name__}"]
             break
         dialogue, emotion = tidy(out["dialogue"], out["emotion"], pressure, confessed)
-        problems = check_dialogue(game, suspect_id, dialogue, question, evidence_id, confessed)
+        problems = check_dialogue(game, suspect_id, dialogue, question, evidence_id, confessed, mentioned_clue_id)
         if not problems:
             return {"dialogue": dialogue, "emotion": emotion, "ai_ok": True,
                     "fixed": attempt > 0, "problems": []}

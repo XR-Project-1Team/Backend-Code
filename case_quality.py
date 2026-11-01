@@ -198,7 +198,19 @@ def check_case_quality(case: dict, expected_culprit_id: Optional[int] = None) ->
                 if name in text:
                     errors.append(f"용의자 {s_id}의 질문 '{text}'에 아직 못 찾은 단서 이름 '{name}'이(가) 들어 있습니다.")
 
-    # 15. 말투 정보 (persona.py가 쓰는 speech_style) - 없으면 경고만
+    # 15. 단서 질문: 없으면 질문 틀로 대신하므로 경고만. 정답 노출 단어·범인 이름은 오류
+    for e_id, e in evidence_db.items():
+        text = str(e.get("question") or "").strip()
+        if not text:
+            errors.append(f"[경고] 단서 {e_id}에 단서 질문(question)이 없습니다. 질문 틀로 대신합니다.")
+            continue
+        for w in SPOILER_WORDS:
+            if w in text:
+                errors.append(f"단서 {e_id}의 질문 '{text}'에 '{w}'라는 단어가 있어 정답이 드러날 수 있습니다.")
+        if culprit_name and culprit_name in text:
+            errors.append(f"단서 {e_id}의 질문에 범인 이름 '{culprit_name}'이(가) 들어 있습니다.")
+
+    # 16. 말투 정보 (persona.py가 쓰는 speech_style) - 없으면 경고만
     for s_id, s in suspects.items():
         if not s.get("speech_style"):
             errors.append(f"[경고] 용의자 {s_id}에게 speech_style(말투 설정)이 없습니다. 기본 말투로 대체됩니다.")
